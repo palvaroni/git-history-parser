@@ -52,7 +52,7 @@ class GitCommitParser:
             print(f"Error output: {e.stderr}")
             raise
     
-    def get_commit_list(self, max_count: int = None) -> List[str]:
+    def get_commit_list(self, skip: int = None, max_count: int = None) -> List[str]:
         """
         Get a list of commit hashes.
         
@@ -62,7 +62,13 @@ class GitCommitParser:
         Returns:
             List[str]: List of commit hashes
         """
-        command = ["log", "--pretty=format:%H"]
+        command = [
+            "log",
+            "--pretty=format:%H"]
+        
+        if skip:
+            command.extend(["--skip", str(skip)])
+
         if max_count:
             command.extend(["-n", str(max_count)])
         
@@ -328,7 +334,7 @@ class GitCommitParser:
         
         return modifications
 
-    def parse_commits(self, max_count: int = None) -> Tuple[List[Dict], Dict[str, str]]:
+    def parse_commits(self, skip: int = None, max_count: int = None) -> Tuple[List[Dict], Dict[str, str]]:
         """
         Parse commits and return detailed modification data along with summary statistics.
         
@@ -339,7 +345,7 @@ class GitCommitParser:
             List[Dict]: List of commit data dictionaries with detailed modifications
         """
         print("Getting commit list...")
-        commit_hashes = self.get_commit_list(max_count)
+        commit_hashes = self.get_commit_list(skip, max_count)
         
         if not commit_hashes:
             print("No commits found in the repository.")
@@ -360,6 +366,7 @@ class GitCommitParser:
             # Get detailed diff statistics
             (modifications, affected_commits) = self.get_commit_diff_stats(commit_hash)
 
+            # TODO: Handle skipped commits (need some sort of caching over multiple runs)
             for affected_commit in affected_commits:
                 if affected_commit not in commit_modified_at:
                     commit_modified_at[affected_commit] = commit_info['date']
@@ -376,7 +383,7 @@ class GitCommitParser:
         
         return (commit_data)
 
-    def write_to_csv(self, commit_data: List[Dict], output_file: str):
+    def write_to_csv(self, commit_data: List[Dict], output_file: str, use_append: bool = False):
         """
         Write detailed modification data to a CSV file.
         
@@ -386,14 +393,16 @@ class GitCommitParser:
         """
         print(f"Writing detailed modifications to {output_file}...")
         
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        with open(output_file, 'a' if use_append else 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
                 'commit_hash', 'author', 'date', 'modified_at', 'modification_type', 
                 'file_path', 'start_line', 'end_line', 'line_count'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
-            writer.writeheader()
+            if not use_append or os.stat(output_file).st_size == 0:
+                writer.writeheader()
+
             for commit in commit_data:
                 if 'modifications' in commit:
                     for mod in commit['modifications']:                        
@@ -428,6 +437,17 @@ def main():
         help="Output CSV file name (default: git_commits.csv)"
     )
     parser.add_argument(
+        "--append", "-a",
+        action='store_true',
+        default=False,
+        help="Use append mode when writing to the output file."
+    )
+    parser.add_argument(
+        "--skip", "-s",
+        type=int,
+        help="Skip n commits to process (default: 0)"
+    )
+    parser.add_argument(
         "--max-commits", "-n",
         type=int,
         help="Maximum number of commits to process (default: all commits)"
@@ -445,14 +465,14 @@ def main():
         git_parser = GitCommitParser(args.repo_path)
         
         # Parse commits
-        commit_data = git_parser.parse_commits(args.max_commits)
+        commit_data = git_parser.parse_commits(args.skip, args.max_commits)
         
         if not commit_data:
             print("No commit data to write.")
             return 1
         
         # Write to CSV
-        git_parser.write_to_csv(commit_data, args.output)
+        git_parser.write_to_csv(commit_data, args.output, use_append=args.append)
         
         # Print summary
         print(f"\nSummary:")

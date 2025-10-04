@@ -26,8 +26,10 @@ if ($args.Count -eq 0) {
     Write-Host "  .\run_parser.ps1                                   # Parse current directory"
     Write-Host "  .\run_parser.ps1 --repo-path C:\path\to\repo       # Parse specific repo"
     Write-Host "  .\run_parser.ps1 --max-commits 100                 # Limit to 100 commits"
+    Write-Host "  .\run_parser.ps1 --skip 10                         # Skip first 10 commits"
     Write-Host "  .\run_parser.ps1 --output results.csv              # Custom output file"
-    Write-Host "  .\run_parser.ps1 --help                           # Show all options"
+    Write-Host "  .\run_parser.ps1 --append                          # Append output to the end of the file"
+    Write-Host "  .\run_parser.ps1 --help                            # Show all options"
     Write-Host ""
 }
 
