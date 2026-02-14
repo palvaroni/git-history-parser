@@ -64,6 +64,7 @@ class GitCommitParser:
         """
         command = [
             "log",
+            "--no-merges",
             "--pretty=format:%H"]
         
         if skip:
@@ -354,7 +355,6 @@ class GitCommitParser:
         
         print(f"Found {len(commit_hashes)} commits. Processing...")
         
-        commit_modified_at = {}
         commit_data = []
         for i, commit_hash in enumerate(commit_hashes, 1):
             print(f"Processing commit {i}/{len(commit_hashes)}: {commit_hash[:8]}...")
@@ -366,11 +366,6 @@ class GitCommitParser:
             
             # Get detailed diff statistics
             (modifications, affected_commits) = self.get_commit_diff_stats(commit_hash)
-
-            # TODO: Handle skipped commits (need some sort of caching over multiple runs)
-            for affected_commit in affected_commits:
-                if affected_commit not in commit_modified_at:
-                    commit_modified_at[affected_commit] = commit_info['date']
             
             commit_data.append({
                 'commit_hash': commit_info['hash'],
@@ -379,9 +374,6 @@ class GitCommitParser:
                 'message': commit_info.get('message', ''),
                 'modifications': modifications
             })
-
-        for commit in commit_data:
-            commit['modified_at'] = commit_modified_at.get(commit['commit_hash'], None)
         
         return (commit_data)
 
@@ -397,7 +389,7 @@ class GitCommitParser:
         
         with open(output_file, 'a' if use_append else 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'commit_hash', 'date', 'modified_at', 'message', 'affected_files',
+                'commit_hash', 'date', 'message', 'affected_files',
                 'additions', 'deletions', 'modifications'
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -428,7 +420,6 @@ class GitCommitParser:
                 writer.writerow({
                     'commit_hash': commit['commit_hash'],
                     'date': commit['date'],
-                    'modified_at': commit['modified_at'],
                     'message': commit.get('message', ''),
                     'affected_files': ';'.join(sorted(affected_files)),
                     'additions': additions_count,
