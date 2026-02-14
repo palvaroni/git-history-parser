@@ -36,7 +36,7 @@ if ($args.Count -eq 0) {
 # Run the parser with the virtual environment
 Write-Host "Running git parser..." -ForegroundColor Yellow
 try {
-    & ".venv\Scripts\python.exe" "git_parser.py" $args
+    & ".venv\Scripts\python.exe" "git_parser_v2.py" $args
     Write-Host "`nDone! Check the output CSV file." -ForegroundColor Green
 } catch {
     Write-Host "Error running parser: $_" -ForegroundColor Red
