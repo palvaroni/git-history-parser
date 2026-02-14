@@ -1,17 +1,14 @@
 # Requirements file for Git Commit History Parser
-# This project uses only Python standard library modules
-# No external dependencies are required
 
-# The following modules are used (all part of Python standard library):
+# External dependencies
+pyodbc>=4.0.0
+
+# The following modules are also used (all part of Python standard library):
 # - subprocess: For running git commands
 # - csv: For CSV file operations
-# - re: For regular expressions (imported but available if needed)
+# - re: For regular expressions
 # - argparse: For command-line argument parsing
 # - datetime: For date/time handling
 # - typing: For type hints
 # - os: For file system operations
-
-# If you want to add additional dependencies in the future, add them here
-# Example:
-# pandas>=1.3.0
-# numpy>=1.21.0
+# - json: For configuration file parsing

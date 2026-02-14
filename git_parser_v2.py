@@ -11,6 +11,12 @@ import re
 import argparse
 from typing import List, Dict, Tuple
 import os
+import json
+from datetime import datetime
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
 from modification import Modification, CommitType
 
 
@@ -428,6 +434,114 @@ class GitCommitParser:
                 })
         
         print(f"Successfully wrote aggregated commit data to {output_file}")
+        
+    def write_to_database(self, commit_data: List[Dict], config_file: str = 'config.json'):
+        """
+        Write aggregated commit data to a MSSQL database.
+        
+        Args:
+            commit_data (List[Dict]): List of commit data dictionaries with modifications
+            config_file (str): Path to the configuration file with database credentials
+        """
+        if pyodbc is None:
+            print("Error: pyodbc is not installed. Install it with: pip install pyodbc")
+            return
+        
+        # Load configuration
+        if not os.path.exists(config_file):
+            print(f"Error: Configuration file '{config_file}' not found.")
+            print("Please create a config.json file with database credentials.")
+            return
+        
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        db_config = config.get('database', {})
+        
+        # Extract repository name from repo_path (leaf directory name)
+        repository_name = os.path.basename(os.path.abspath(self.repo_path))
+        
+        # Build connection string
+        conn_str = (
+            f"DRIVER={{{db_config.get('driver', 'ODBC Driver 17 for SQL Server')}}};"
+            f"SERVER={db_config.get('server', 'localhost')};"
+            f"DATABASE={db_config.get('database', 'GitAnalysis')};"
+            f"UID={db_config.get('username')};"
+            f"PWD={db_config.get('password')}"
+        )
+        
+        print(f"Connecting to database...")
+        
+        try:
+            conn = pyodbc.connect(conn_str)
+            cursor = conn.cursor()
+            
+            print(f"Writing aggregated commit data to database...")
+            
+            insert_query = """
+                INSERT INTO [dbo].[commits] 
+                    (repository, commit_hash, date, message, affected_files, additions, deletions, modifications)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            
+            inserted_count = 0
+            skipped_count = 0
+            
+            for commit in commit_data:
+                # Aggregate modifications per commit
+                additions_count = 0
+                deletions_count = 0
+                modifications_count = 0
+                affected_files = set()
+                
+                if 'modifications' in commit:
+                    for mod in commit['modifications']:
+                        # Collect affected files
+                        affected_files.update(mod.file_paths)
+                        
+                        # Count line changes by type
+                        if mod.type == CommitType.ADDITION:
+                            additions_count += mod.line_count
+                        elif mod.type == CommitType.DELETION:
+                            deletions_count += mod.line_count
+                        elif mod.type == CommitType.MODIFICATION:
+                            modifications_count += mod.line_count
+                
+                try:
+                    # Parse date string to datetime (format: "2024-01-15 10:30:45 +0200")
+                    # Take first 19 characters to get "YYYY-MM-DD HH:MM:SS"
+                    date_str = commit['date'][:19]
+                    commit_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                    
+                    cursor.execute(insert_query, (
+                        repository_name,
+                        commit['commit_hash'],
+                        commit_date,
+                        commit.get('message', ''),
+                        ';'.join(sorted(affected_files)),
+                        additions_count,
+                        deletions_count,
+                        modifications_count
+                    ))
+                    inserted_count += 1
+                except pyodbc.IntegrityError:
+                    # Skip duplicate commits (based on unique constraint)
+                    skipped_count += 1
+                except Exception as e:
+                    print(f"Warning: Failed to insert commit {commit['commit_hash'][:8]}: {e}")
+                    skipped_count += 1
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            print(f"Successfully wrote {inserted_count} commits to database.")
+            if skipped_count > 0:
+                print(f"Skipped {skipped_count} commits (duplicates or errors).")
+            
+        except Exception as e:
+            print(f"Database error: {e}")
+            raise
 
 
 def main():
@@ -461,6 +575,17 @@ def main():
         type=int,
         help="Maximum number of commits to process (default: all commits)"
     )
+    parser.add_argument(
+        "--database", "-d",
+        action='store_true',
+        default=True,
+        help="Write to database instead of CSV"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        default="config.json",
+        help="Path to configuration file for database credentials (default: config.json)"
+    )
     
     args = parser.parse_args()
     
@@ -480,8 +605,11 @@ def main():
             print("No commit data to write.")
             return 1
         
-        # Write to CSV
-        git_parser.write_to_csv(commit_data, args.output, use_append=args.append)
+        # Write to database or CSV
+        if args.database:
+            git_parser.write_to_database(commit_data, args.config)
+        else:
+            git_parser.write_to_csv(commit_data, args.output, use_append=args.append)
         
         # Print summary
         print(f"\nSummary:")

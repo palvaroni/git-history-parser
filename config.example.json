@@ -1,0 +1,9 @@
+{
+  "database": {
+    "server": "localhost",
+    "database": "GitAnalysis",
+    "username": "your_username_here",
+    "password": "your_password_here",
+    "driver": "ODBC Driver 17 for SQL Server"
+  }
+}
