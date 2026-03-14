@@ -141,11 +141,13 @@ class GitCommitParser:
             current_prev_commits = None
             current_source_file = None
             current_target_file = None
+            current_old_nloc = set()
+            current_new_nloc = set()
             i = 0
-            
+
             while i < len(lines):
                 line = lines[i]
-                
+
                 # Parse file headers
                 if line.startswith('diff --git'):
                     # Extract file path from "diff --git a/path b/path"
@@ -154,6 +156,32 @@ class GitCommitParser:
                     if file_match and len(file_match.groups()) >= 2:
                         current_source_file = file_match.group(1)
                         current_target_file = file_match.group(2)
+
+                        # Detect new/deleted/modified and compute nloc sets
+                        is_new_file = False
+                        is_deleted_file = False
+                        j = i + 1
+                        while j < len(lines) and not lines[j].startswith('@@') and not lines[j].startswith('diff --git'):
+                            if lines[j].startswith('new file mode'):
+                                is_new_file = True
+                            elif lines[j].startswith('deleted file mode'):
+                                is_deleted_file = True
+                            j += 1
+
+                        lang = self._detect_language(current_target_file)
+                        if is_new_file:
+                            current_old_nloc = set()
+                            new_content = self._get_file_content(commit_hash, current_target_file, use_parent=False)
+                            current_new_nloc = self._get_nloc_lines(new_content, lang)
+                        elif is_deleted_file:
+                            old_content = self._get_file_content(commit_hash, current_source_file, use_parent=True)
+                            current_old_nloc = self._get_nloc_lines(old_content, lang)
+                            current_new_nloc = set()
+                        else:
+                            old_content = self._get_file_content(commit_hash, current_source_file, use_parent=True)
+                            new_content = self._get_file_content(commit_hash, current_target_file, use_parent=False)
+                            current_old_nloc = self._get_nloc_lines(old_content, lang)
+                            current_new_nloc = self._get_nloc_lines(new_content, lang)
 
                         # Use git blame to get the previous commit hash for each line.
                         if i + 1 < len(lines):
@@ -165,7 +193,7 @@ class GitCommitParser:
 
                     i += 1
                     continue
-                
+
                 # Parse hunk headers like @@ -start,count +start,count @@
                 if line.startswith('@@'):
                     hunk_match = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
@@ -174,13 +202,14 @@ class GitCommitParser:
                         old_count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
                         new_start = int(hunk_match.group(3))
                         new_count = int(hunk_match.group(4)) if hunk_match.group(4) else 1
-                        
+
                         # Process the hunk content
                         hunk_modifications = self._parse_hunk(
                             lines, i + 1,
                             current_source_file, current_target_file,
-                            old_start, old_count, 
-                            new_start, new_count
+                            old_start, old_count,
+                            new_start, new_count,
+                            current_old_nloc, current_new_nloc
                         )
                         modifications.extend(hunk_modifications)
 
@@ -237,11 +266,125 @@ class GitCommitParser:
                     prev_commits[current_line] = commit_id
         
         return prev_commits
-    
+
+    def _get_file_content(self, commit_hash: str, file_path: str, use_parent: bool = False) -> str:
+        ref = f"{commit_hash}~:{file_path}" if use_parent else f"{commit_hash}:{file_path}"
+        try:
+            result = subprocess.run(
+                ["git", "show", ref],
+                cwd=self.repo_path,
+                capture_output=True,
+                encoding='utf-8',
+                errors='replace',
+                text=True,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except Exception:
+            pass
+        return ""
+
+    def _detect_language(self, file_path: str) -> str:
+        ext = os.path.splitext(file_path)[1].lower()
+        c_style_exts = {'.java', '.js', '.ts', '.jsx', '.tsx', '.c', '.cpp', '.h', '.cs', '.go', '.kt', '.rs', '.scala', '.swift'}
+        if ext == '.py':
+            return 'python'
+        if ext in c_style_exts:
+            return 'c_style'
+        if ext == '.sql':
+            return 'sql'
+        if ext in {'.html', '.xml', '.xaml'}:
+            return 'html'
+        if ext == '.rb':
+            return 'ruby'
+        if ext == '.vb':
+            return 'vb'
+        return 'generic'
+
+    def _get_nloc_lines(self, content: str, language: str) -> set:
+        LINE_COMMENT = {
+            'c_style': '//',
+            'python':  '#',
+            'sql':     '--',
+            'html':    None,
+            'ruby':    '#',
+            'vb':      None,   # handled specially
+            'generic': None,   # handled specially
+        }
+        BLOCK_OPEN = {
+            'c_style': [('/*', '*/')],
+            'python':  [('"""', '"""'), ("'''", "'''")],
+            'sql':     [('/*', '*/')],
+            'html':    [('<!--', '-->')],
+            'ruby':    [('=begin', '=end')],
+            'vb':      [],
+            'generic': [],
+        }
+
+        line_prefix = LINE_COMMENT.get(language)
+        block_pairs = BLOCK_OPEN.get(language, [])
+
+        nloc = set()
+        in_block = False
+        block_close = None
+
+        for line_num, raw in enumerate(content.splitlines(), start=1):
+            stripped = raw.strip()
+
+            # --- inside a block comment ---
+            if in_block:
+                if block_close and block_close in stripped:
+                    in_block = False
+                continue
+
+            # --- empty line ---
+            if not stripped:
+                continue
+
+            # --- vb line comment ---
+            if language == 'vb':
+                if stripped.startswith("'") or stripped.upper().startswith('REM ') or stripped.upper() == 'REM':
+                    continue
+
+            # --- generic: treat # and // as line comments ---
+            if language == 'generic':
+                if stripped.startswith('#') or stripped.startswith('//'):
+                    continue
+
+            # --- standard line comment ---
+            if line_prefix and stripped.startswith(line_prefix):
+                continue
+
+            # --- check for block-comment openers ---
+            entered_block = False
+            for bopen, bclose in block_pairs:
+                if bopen in stripped:
+                    idx = stripped.index(bopen)
+                    code_before = stripped[:idx].strip()
+                    in_block = True
+                    block_close = bclose
+                    entered_block = True
+                    # NLOC only if non-trivial code precedes the opener
+                    if code_before:
+                        nloc.add(line_num)
+                    # check if block closes on same line
+                    rest_after = stripped[idx + len(bopen):]
+                    if bclose in rest_after:
+                        in_block = False
+                    break
+
+            if entered_block:
+                continue
+
+            nloc.add(line_num)
+
+        return nloc
+
     def _parse_hunk(self, lines: List[str], start_idx: int,
-                    old_file_path: str, new_file_path: str, 
+                    old_file_path: str, new_file_path: str,
                     old_start: int, old_count: int,
-                    new_start: int, new_count: int
+                    new_start: int, new_count: int,
+                    old_nloc: set = None, new_nloc: set = None
                 ) -> List[Modification]:
         """
         Parse a diff hunk and return Modification objects.
@@ -303,42 +446,47 @@ class GitCommitParser:
             i += 1
 
         file_paths = [old_file_path, new_file_path] if old_file_path != new_file_path else [new_file_path]
-        
+        _old_nloc = old_nloc or set()
+        _new_nloc = new_nloc or set()
+
         # If hunk contains both additions and deletions, treat as a modification.
         if row_deletions and row_additions:
             start_line = min(row_additions[0]['line_num'], row_deletions[0]['line_num'])
             end_line = max(row_additions[-1]['line_num'], row_deletions[-1]['line_num'])
-            
-            modifications.append(Modification(
+            mod = Modification(
                 type=CommitType.MODIFICATION,
                 file_paths=file_paths,
                 start_line=start_line,
                 end_line=end_line,
-            ))
+            )
+            mod.nloc_count = sum(1 for r in row_additions if r['line_num'] in _new_nloc)
+            modifications.append(mod)
 
         # Pure deletion
         elif row_deletions:
             start_line = row_deletions[0]['line_num']
             end_line = row_deletions[-1]['line_num']
-            
-            modifications.append(Modification(
+            mod = Modification(
                 type=CommitType.DELETION,
                 file_paths=file_paths,
                 start_line=start_line,
                 end_line=end_line
-            ))
-            
+            )
+            mod.nloc_count = sum(1 for r in row_deletions if r['line_num'] in _old_nloc)
+            modifications.append(mod)
+
         elif row_additions:
             # Pure addition
             start_line = row_additions[0]['line_num']
             end_line = row_additions[-1]['line_num']
-            
-            modifications.append(Modification(
+            mod = Modification(
                 type=CommitType.ADDITION,
                 file_paths=file_paths,
                 start_line=start_line,
                 end_line=end_line
-            ))
+            )
+            mod.nloc_count = sum(1 for r in row_additions if r['line_num'] in _new_nloc)
+            modifications.append(mod)
         
         return modifications
 
@@ -383,85 +531,72 @@ class GitCommitParser:
         
         return (commit_data)
 
+    def _aggregate_per_file(self, commit: Dict) -> List[Dict]:
+        """Return list of per-file stat dicts for a single commit."""
+        file_stats: Dict[str, Dict] = {}
+        for mod in commit.get('modifications', []):
+            fp = mod.file_paths[-1]
+            if fp not in file_stats:
+                file_stats[fp] = {
+                    'additions': 0, 'deletions': 0, 'modifications': 0,
+                    'nloc_additions': 0, 'nloc_deletions': 0, 'nloc_modifications': 0,
+                }
+            s = file_stats[fp]
+            if mod.type == CommitType.ADDITION:
+                s['additions'] += mod.line_count
+                s['nloc_additions'] += mod.nloc_count
+            elif mod.type == CommitType.DELETION:
+                s['deletions'] += mod.line_count
+                s['nloc_deletions'] += mod.nloc_count
+            elif mod.type == CommitType.MODIFICATION:
+                s['modifications'] += mod.line_count
+                s['nloc_modifications'] += mod.nloc_count
+        rows = []
+        for fp, s in file_stats.items():
+            rows.append({
+                'commit_hash': commit['commit_hash'],
+                'date': commit['date'],
+                'message': commit.get('message', ''),
+                'file_path': fp,
+                **s,
+            })
+        return rows
+
     def write_to_csv(self, commit_data: List[Dict], output_file: str, use_append: bool = False):
-        """
-        Write aggregated commit data to a CSV file.
-        
-        Args:
-            commit_data (List[Dict]): List of commit data dictionaries with modifications
-            output_file (str): Output CSV file path
-        """
         print(f"Writing aggregated commit data to {output_file}...")
-        
+
         with open(output_file, 'a' if use_append else 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = [
-                'commit_hash', 'date', 'message', 'affected_files',
-                'additions', 'deletions', 'modifications'
+                'commit_hash', 'date', 'message', 'file_path',
+                'additions', 'deletions', 'modifications',
+                'nloc_additions', 'nloc_deletions', 'nloc_modifications',
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
+
             if not use_append or os.stat(output_file).st_size == 0:
                 writer.writeheader()
 
             for commit in commit_data:
-                # Aggregate modifications per commit
-                additions_count = 0
-                deletions_count = 0
-                modifications_count = 0
-                affected_files = set()
-                
-                if 'modifications' in commit:
-                    for mod in commit['modifications']:
-                        # Collect affected files
-                        affected_files.update(mod.file_paths)
-                        
-                        # Count line changes by type
-                        if mod.type == CommitType.ADDITION:
-                            additions_count += mod.line_count
-                        elif mod.type == CommitType.DELETION:
-                            deletions_count += mod.line_count
-                        elif mod.type == CommitType.MODIFICATION:
-                            modifications_count += mod.line_count
-                
-                writer.writerow({
-                    'commit_hash': commit['commit_hash'],
-                    'date': commit['date'],
-                    'message': commit.get('message', ''),
-                    'affected_files': ';'.join(sorted(affected_files)),
-                    'additions': additions_count,
-                    'deletions': deletions_count,
-                    'modifications': modifications_count
-                })
-        
+                for row in self._aggregate_per_file(commit):
+                    writer.writerow(row)
+
         print(f"Successfully wrote aggregated commit data to {output_file}")
         
     def write_to_database(self, commit_data: List[Dict], config_file: str = 'config.json'):
-        """
-        Write aggregated commit data to a MSSQL database.
-        
-        Args:
-            commit_data (List[Dict]): List of commit data dictionaries with modifications
-            config_file (str): Path to the configuration file with database credentials
-        """
         if pyodbc is None:
             print("Error: pyodbc is not installed. Install it with: pip install pyodbc")
             return
-        
-        # Load configuration
+
         if not os.path.exists(config_file):
             print(f"Error: Configuration file '{config_file}' not found.")
-            print("Please create a config.json file with database credentials.")
             return
-        
+
         with open(config_file, 'r') as f:
             config = json.load(f)
-        
+
         db_config = config.get('database', {})
-        
-        # Extract repository name from repo_path (leaf directory name)
         repository_name = os.path.basename(os.path.abspath(self.repo_path))
-        
-        # Build connection string
+
         conn_str = (
             f"DRIVER={{{db_config.get('driver', 'ODBC Driver 17 for SQL Server')}}};"
             f"SERVER={db_config.get('server', 'localhost')};"
@@ -469,76 +604,59 @@ class GitCommitParser:
             f"UID={db_config.get('username')};"
             f"PWD={db_config.get('password')}"
         )
-        
-        print(f"Connecting to database...")
-        
+
+        print("Connecting to database...")
+
         try:
             conn = pyodbc.connect(conn_str)
             cursor = conn.cursor()
-            
-            print(f"Writing aggregated commit data to database...")
-            
+
+            print("Writing per-file commit data to database...")
+
             insert_query = """
-                INSERT INTO [dbo].[commits] 
-                    (repository, commit_hash, date, message, affected_files, additions, deletions, modifications)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO [dbo].[commit_files]
+                    (repository, commit_hash, date, message, file_path,
+                     additions, deletions, modifications,
+                     nloc_additions, nloc_deletions, nloc_modifications)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
-            
+
             inserted_count = 0
             skipped_count = 0
-            
+
             for commit in commit_data:
-                # Aggregate modifications per commit
-                additions_count = 0
-                deletions_count = 0
-                modifications_count = 0
-                affected_files = set()
-                
-                if 'modifications' in commit:
-                    for mod in commit['modifications']:
-                        # Collect affected files
-                        affected_files.update(mod.file_paths)
-                        
-                        # Count line changes by type
-                        if mod.type == CommitType.ADDITION:
-                            additions_count += mod.line_count
-                        elif mod.type == CommitType.DELETION:
-                            deletions_count += mod.line_count
-                        elif mod.type == CommitType.MODIFICATION:
-                            modifications_count += mod.line_count
-                
-                try:
-                    # Parse date string to datetime (format: "2024-01-15 10:30:45 +0200")
-                    # Take first 19 characters to get "YYYY-MM-DD HH:MM:SS"
-                    date_str = commit['date'][:19]
-                    commit_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-                    
-                    cursor.execute(insert_query, (
-                        repository_name,
-                        commit['commit_hash'],
-                        commit_date,
-                        commit.get('message', ''),
-                        ';'.join(sorted(affected_files)),
-                        additions_count,
-                        deletions_count,
-                        modifications_count
-                    ))
-                    inserted_count += 1
-                except pyodbc.IntegrityError:
-                    # Skip duplicate commits (based on unique constraint)
-                    skipped_count += 1
-                except Exception as e:
-                    print(f"Warning: Failed to insert commit {commit['commit_hash'][:8]}: {e}")
-                    skipped_count += 1
-            
+                date_str = commit['date'][:19]
+                commit_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                for row in self._aggregate_per_file(commit):
+                    try:
+                        cursor.execute(insert_query, (
+                            repository_name,
+                            row['commit_hash'],
+                            commit_date,
+                            row['message'],
+                            row['file_path'],
+                            row['additions'],
+                            row['deletions'],
+                            row['modifications'],
+                            row['nloc_additions'],
+                            row['nloc_deletions'],
+                            row['nloc_modifications'],
+                        ))
+                        inserted_count += 1
+                    except pyodbc.IntegrityError:
+                        skipped_count += 1
+                    except Exception as e:
+                        print(f"Warning: Failed to insert row for {row['commit_hash'][:8]} / {row['file_path']}: {e}")
+                        skipped_count += 1
+
             conn.commit()
             cursor.close()
             conn.close()
-            
-            print(f"Successfully wrote {inserted_count} commits to database.")
+
+            print(f"Successfully wrote {inserted_count} rows to database.")
             if skipped_count > 0:
-                print(f"Skipped {skipped_count} commits (duplicates or errors).")
-            
+                print(f"Skipped {skipped_count} rows (duplicates or errors).")
+
         except Exception as e:
             print(f"Database error: {e}")
             raise

@@ -12,6 +12,7 @@ class Modification:
         self.file_paths = file_paths
         self.start_line = start_line
         self.end_line = end_line
+        self.nloc_count: int = 0
     
     @property
     def lines_modified(self) -> List[int]:
@@ -24,4 +25,4 @@ class Modification:
         return self.end_line - self.start_line + 1
     
     def __repr__(self):
-        return f"Modification(type={self.type}, file_paths={self.file_paths}, start_line={self.start_line}, end_line={self.end_line})"
+        return f"Modification(type={self.type}, file_paths={self.file_paths}, start_line={self.start_line}, end_line={self.end_line}, nloc_count={self.nloc_count})"
