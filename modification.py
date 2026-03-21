@@ -7,22 +7,11 @@ class CommitType(Enum):
     MODIFICATION = "MODIFICATION"
 
 class Modification:
-    def __init__(self, type: CommitType, file_paths: List[str], start_line: int, end_line: int):
+    def __init__(self, type: CommitType, file_paths: List[str]):
         self.type = type
         self.file_paths = file_paths
-        self.start_line = start_line
-        self.end_line = end_line
+        self.loc_count: int = 0
         self.nloc_count: int = 0
-    
-    @property
-    def lines_modified(self) -> List[int]:
-        """Return list of line numbers that were modified."""
-        return list(range(self.start_line, self.end_line + 1))
-    
-    @property
-    def line_count(self) -> int:
-        """Return the number of lines modified."""
-        return self.end_line - self.start_line + 1
-    
+
     def __repr__(self):
-        return f"Modification(type={self.type}, file_paths={self.file_paths}, start_line={self.start_line}, end_line={self.end_line}, nloc_count={self.nloc_count})"
+        return f"Modification(type={self.type}, file_paths={self.file_paths}, loc_count={self.loc_count}, nloc_count={self.nloc_count})"

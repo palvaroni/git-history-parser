@@ -129,16 +129,14 @@ class GitCommitParser:
             # Get the diff with context to identify modifications.
             command = [
                 "show",
-                "--unified=0",  # No context lines to get exact line numbers
+                "--unified=0",  # Output chunks only
                 "--diff-algorithm=histogram",
                 commit_hash
             ]
             diff_output = self._run_git_command(command)
             
             modifications = []
-            affected_commits = []
             lines = diff_output.split('\n')
-            current_prev_commits = None
             current_source_file = None
             current_target_file = None
             current_old_nloc = set()
@@ -183,18 +181,11 @@ class GitCommitParser:
                             current_old_nloc = self._get_nloc_lines(old_content, lang)
                             current_new_nloc = self._get_nloc_lines(new_content, lang)
 
-                        # Use git blame to get the previous commit hash for each line.
-                        if i + 1 < len(lines):
-                            next_line = lines[i + 1]
-                            # File mode 160000 indicates a submodule
-                            if next_line.startswith('index ') and not next_line.endswith(' 160000'):
-                                # File exists in previous commit
-                                current_prev_commits = self._get_prev_commits_by_line(current_source_file, commit_hash)
-
                     i += 1
                     continue
 
                 # Parse hunk headers like @@ -start,count +start,count @@
+                # The hunk header may not contain ,count in which case it affects only 1 line.
                 if line.startswith('@@'):
                     hunk_match = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
                     if hunk_match and current_target_file:
@@ -207,19 +198,11 @@ class GitCommitParser:
                         hunk_modifications = self._parse_hunk(
                             lines, i + 1,
                             current_source_file, current_target_file,
-                            old_start, old_count,
-                            new_start, new_count,
+                            old_start, new_start,
                             current_old_nloc, current_new_nloc
                         )
                         modifications.extend(hunk_modifications)
 
-                        # Identify affected previous commits
-                        for line in range(old_start, old_start + old_count):
-                            if current_prev_commits and line in current_prev_commits:
-                                prev_commit = current_prev_commits[line]
-                                if prev_commit not in affected_commits:
-                                    affected_commits.append(prev_commit)
-                        
                         # Skip to next hunk
                         i += 1
                         while i < len(lines) and not lines[i].startswith('@@') and not lines[i].startswith('diff --git'):
@@ -228,45 +211,12 @@ class GitCommitParser:
                 
                 i += 1
             
-            return (modifications, affected_commits)
+            return modifications
             
         except subprocess.CalledProcessError:
             # Return empty list if we can't get diff stats
             return []
         
-    def _get_prev_commits_by_line(self, file_path: str, commit_hash: str) -> Dict[int, str]:
-        """
-        Get previous commit hashes for each line in a file using git blame.
-        
-        Args:
-            file_path (str): Path of the file
-            commit_hash (str): The commit hash
-            
-        Returns:
-            Dict[int, str]: Mapping of line numbers to previous commit hashes
-        """
-        blame_output = self._run_git_command([
-            "blame",
-            "-l",
-            "--porcelain",
-            f"{commit_hash}~",
-            "--",
-            file_path
-        ])
-        
-        prev_commits = {}
-        current_line = 0
-        
-        for line in blame_output.split('\n'):
-            if re.match(r'^[0-9a-f]{40} ', line):
-                parts = line.split()
-                if len(parts) >= 2:
-                    commit_id = parts[0]
-                    current_line += 1
-                    prev_commits[current_line] = commit_id
-        
-        return prev_commits
-
     def _get_file_content(self, commit_hash: str, file_path: str, use_parent: bool = False) -> str:
         ref = f"{commit_hash}~:{file_path}" if use_parent else f"{commit_hash}:{file_path}"
         try:
@@ -382,8 +332,7 @@ class GitCommitParser:
 
     def _parse_hunk(self, lines: List[str], start_idx: int,
                     old_file_path: str, new_file_path: str,
-                    old_start: int, old_count: int,
-                    new_start: int, new_count: int,
+                    old_start: int, new_start: int,
                     old_nloc: set = None, new_nloc: set = None
                 ) -> List[Modification]:
         """
@@ -420,7 +369,7 @@ class GitCommitParser:
             if line.startswith('@@') or line.startswith('diff --git'):
                 break
                 
-            if line.startswith('-') and not line.startswith('---'):
+            if line.startswith('-'):
                 # A deleted row
                 row_deletions.append({
                     'line_num': old_line,
@@ -429,7 +378,7 @@ class GitCommitParser:
                 })
                 old_line += 1
                 
-            elif line.startswith('+') and not line.startswith('+++'):
+            elif line.startswith('+'):
                 # An added row
                 row_additions.append({
                     'line_num': new_line,
@@ -451,40 +400,33 @@ class GitCommitParser:
 
         # If hunk contains both additions and deletions, treat as a modification.
         if row_deletions and row_additions:
-            start_line = min(row_additions[0]['line_num'], row_deletions[0]['line_num'])
-            end_line = max(row_additions[-1]['line_num'], row_deletions[-1]['line_num'])
-            mod = Modification(
-                type=CommitType.MODIFICATION,
-                file_paths=file_paths,
-                start_line=start_line,
-                end_line=end_line,
-            )
-            mod.nloc_count = sum(1 for r in row_additions if r['line_num'] in _new_nloc)
+            mod = Modification(type=CommitType.MODIFICATION, file_paths=file_paths)
+            mod.loc_count = max(len(row_additions), len(row_deletions))
+            paired = min(len(row_deletions), len(row_additions))
+            nloc_count = 0
+            for k in range(paired):
+                if row_deletions[k]['line_num'] in _old_nloc or row_additions[k]['line_num'] in _new_nloc:
+                    nloc_count += 1
+            for k in range(paired, len(row_deletions)):
+                if row_deletions[k]['line_num'] in _old_nloc:
+                    nloc_count += 1
+            for k in range(paired, len(row_additions)):
+                if row_additions[k]['line_num'] in _new_nloc:
+                    nloc_count += 1
+            mod.nloc_count = nloc_count
             modifications.append(mod)
 
         # Pure deletion
         elif row_deletions:
-            start_line = row_deletions[0]['line_num']
-            end_line = row_deletions[-1]['line_num']
-            mod = Modification(
-                type=CommitType.DELETION,
-                file_paths=file_paths,
-                start_line=start_line,
-                end_line=end_line
-            )
+            mod = Modification(type=CommitType.DELETION, file_paths=file_paths)
+            mod.loc_count = len(row_deletions)
             mod.nloc_count = sum(1 for r in row_deletions if r['line_num'] in _old_nloc)
             modifications.append(mod)
 
         elif row_additions:
             # Pure addition
-            start_line = row_additions[0]['line_num']
-            end_line = row_additions[-1]['line_num']
-            mod = Modification(
-                type=CommitType.ADDITION,
-                file_paths=file_paths,
-                start_line=start_line,
-                end_line=end_line
-            )
+            mod = Modification(type=CommitType.ADDITION, file_paths=file_paths)
+            mod.loc_count = len(row_additions)
             mod.nloc_count = sum(1 for r in row_additions if r['line_num'] in _new_nloc)
             modifications.append(mod)
         
@@ -519,7 +461,7 @@ class GitCommitParser:
                 continue
             
             # Get detailed diff statistics
-            (modifications, affected_commits) = self.get_commit_diff_stats(commit_hash)
+            modifications = self.get_commit_diff_stats(commit_hash)
             
             commit_data.append({
                 'commit_hash': commit_info['hash'],
@@ -543,13 +485,13 @@ class GitCommitParser:
                 }
             s = file_stats[fp]
             if mod.type == CommitType.ADDITION:
-                s['additions'] += mod.line_count
+                s['additions'] += mod.loc_count
                 s['nloc_additions'] += mod.nloc_count
             elif mod.type == CommitType.DELETION:
-                s['deletions'] += mod.line_count
+                s['deletions'] += mod.loc_count
                 s['nloc_deletions'] += mod.nloc_count
             elif mod.type == CommitType.MODIFICATION:
-                s['modifications'] += mod.line_count
+                s['modifications'] += mod.loc_count
                 s['nloc_modifications'] += mod.nloc_count
         rows = []
         for fp, s in file_stats.items():
